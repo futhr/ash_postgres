@@ -27,7 +27,7 @@ defmodule AshPostgres.Upsert do
   # been the behavior since `ON CONFLICT` was introduced in 9.5 and is the standard way to tell
   # the two apart.
   #
-  # The per-clause SQL is produced by Ecto (`Ecto.Adapters.SQL.to_sql/4` with a `:counter`
+  # The per-clause SQL is produced by Ecto (`AshPostgres.Merge.render_sql/3` with a `:counter`
   # offset so `$n` placeholders line up when concatenated), and the generic splicing helpers are
   # shared with `AshPostgres.Merge`.
 
@@ -36,6 +36,7 @@ defmodule AshPostgres.Upsert do
       quote_name: 1,
       quote_table: 2,
       db_column: 2,
+      render_sql: 3,
       split_sql_keyword!: 2,
       read_trailing_alias: 1,
       load_returned_rows: 5
@@ -83,7 +84,6 @@ defmodule AshPostgres.Upsert do
     #    on_conflict query, just as `repo.insert_all/3` does.
     {on_conflict_sql, on_conflict_params, target_alias} =
       build_on_conflict(
-        repo,
         resource,
         Keyword.fetch!(opts, :on_conflict),
         Keyword.fetch!(opts, :conflict_target),
@@ -150,7 +150,7 @@ defmodule AshPostgres.Upsert do
       end)
 
     # `counter` is the number of parameters rendered so far, so the next placeholder is
-    # `$counter+1` (the same convention `Ecto.Adapters.SQL.to_sql/4` uses for `:counter`).
+    # `$counter+1` (the same convention `render_sql/3` uses for its `counter`).
     # `params` accumulates reversed groups of parameters; a group is a list so that array values
     # stay intact when the groups are concatenated.
     {rows_sql, {params, counter}} =
@@ -163,8 +163,7 @@ defmodule AshPostgres.Upsert do
                 {"DEFAULT", {params, counter}}
 
               {:ok, %Ecto.Query{} = query} ->
-                {sql, query_params} =
-                  Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), query, counter: counter)
+                {sql, query_params} = render_sql(:all, query, counter)
 
                 {["(", sql, ")"], {[query_params | params], counter + length(query_params)}}
 
@@ -198,11 +197,10 @@ defmodule AshPostgres.Upsert do
   # `UPDATE "table" AS <alias> SET <set> [WHERE <cond>]` -> ` ON CONFLICT <target> DO UPDATE SET
   # <set> [WHERE <cond>]`. The prefix is applied to the query as `repo.insert_all/3` does, so any
   # subqueries in the SET/WHERE expressions resolve against the same schema as the target table.
-  defp build_on_conflict(repo, resource, %Ecto.Query{} = query, conflict_target, prefix, counter) do
+  defp build_on_conflict(resource, %Ecto.Query{} = query, conflict_target, prefix, counter) do
     query = if prefix, do: %{query | prefix: prefix}, else: query
 
-    {sql, params} =
-      Ecto.Adapters.SQL.to_sql(:update_all, repo.get_dynamic_repo(), query, counter: counter)
+    {sql, params} = render_sql(:update_all, query, counter)
 
     {before_set, set_and_where} = split_sql_keyword!(sql, "SET")
 

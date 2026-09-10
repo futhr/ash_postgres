@@ -21,8 +21,8 @@ defmodule AshPostgres.Merge do
   #   * the `USING` source is rendered by `Ecto.Query.values/2`, which handles type casting
   #     and parameter dumping
   #   * the `SET` clause and the `ON`/`WHEN` conditions are rendered from ordinary Ecto
-  #     queries via `Ecto.Adapters.SQL.to_sql/4`, passing a `:counter` offset so the `$n`
-  #     parameter placeholders of each piece line up when concatenated
+  #     queries by `render_sql/3`, passing a `:counter` offset so the `$n` parameter
+  #     placeholders of each piece line up when concatenated
   #
   # Ecto names the source in its rendered SQL positionally (e.g. `p0`). Rather than rewrite
   # those aliases, the target alias is read back out of the rendered `UPDATE ... AS <alias>`
@@ -92,7 +92,6 @@ defmodule AshPostgres.Merge do
     # 1. USING (VALUES ...) AS EXCLUDED(cols) -- rendered, dumped, and cast by Ecto.
     {values_sql, values_params} =
       build_values_source(
-        repo,
         resource,
         entries,
         opts[:source_fields] || [],
@@ -103,16 +102,16 @@ defmodule AshPostgres.Merge do
 
     # 2. ON <predicate> -- key matching + base_filter, rendered upstream.
     {on_predicate_sql, on_predicate_params, counter, target_alias_from_on} =
-      render_optional_where(repo, Keyword.fetch!(opts, :on_query), counter)
+      render_optional_where(Keyword.fetch!(opts, :on_query), counter)
 
     on_predicate_sql || raise(ArgumentError, "MERGE requires an ON condition")
 
     # 3. WHEN MATCHED [AND <cond>] THEN UPDATE SET <set>  (cond params precede set params)
     {when_matched_cond_sql, when_matched_cond_params, counter, target_alias_from_cond} =
-      render_optional_where(repo, opts[:when_matched_condition_query], counter)
+      render_optional_where(opts[:when_matched_condition_query], counter)
 
     {when_matched_sql, set_params, target_alias_from_set} =
-      build_when_matched(repo, opts[:set_query], when_matched_cond_sql, counter)
+      build_when_matched(opts[:set_query], when_matched_cond_sql, counter)
 
     target_alias =
       pick_target_alias([
@@ -156,7 +155,7 @@ defmodule AshPostgres.Merge do
      })}
   end
 
-  defp build_values_source(repo, resource, entries, extra_fields, extra_columns) do
+  defp build_values_source(resource, entries, extra_fields, extra_columns) do
     entry_fields = entries |> Enum.flat_map(&Map.keys/1) |> Enum.uniq()
 
     # The source is referenced as `EXCLUDED` in the ON/SET/condition clauses. Beyond the entry
@@ -191,10 +190,7 @@ defmodule AshPostgres.Merge do
         Map.merge(attr_values, synthetic_values)
       end)
 
-    {values_sql, values_params} =
-      Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), from(v in values(rows, types)),
-        counter: 0
-      )
+    {values_sql, values_params} = render_sql(:all, from(v in values(rows, types)), 0)
 
     {values_sql, values_params}
   end
@@ -272,14 +268,13 @@ defmodule AshPostgres.Merge do
     resource.__schema__(:field_source, field) || field
   end
 
-  defp build_when_matched(_repo, nil, _cond_sql, _counter), do: {"", [], nil}
+  defp build_when_matched(nil, _cond_sql, _counter), do: {"", [], nil}
 
-  defp build_when_matched(_repo, :do_nothing, _cond_sql, _counter),
+  defp build_when_matched(:do_nothing, _cond_sql, _counter),
     do: {" WHEN MATCHED THEN DO NOTHING", [], nil}
 
-  defp build_when_matched(repo, %Ecto.Query{} = set_query, cond_sql, counter) do
-    {sql, params} =
-      Ecto.Adapters.SQL.to_sql(:update_all, repo.get_dynamic_repo(), set_query, counter: counter)
+  defp build_when_matched(%Ecto.Query{} = set_query, cond_sql, counter) do
+    {sql, params} = render_sql(:update_all, set_query, counter)
 
     {target_alias, set_clause} = extract_set_clause(sql)
 
@@ -377,11 +372,10 @@ defmodule AshPostgres.Merge do
   end
 
   # `SELECT ... FROM "table" AS <alias> WHERE <pred>` -> {alias, "(pred)"}; nil query -> all-nil
-  defp render_optional_where(_repo, nil, counter), do: {nil, [], counter, nil}
+  defp render_optional_where(nil, counter), do: {nil, [], counter, nil}
 
-  defp render_optional_where(repo, %Ecto.Query{} = query, counter) do
-    {sql, params} =
-      Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), query, counter: counter)
+  defp render_optional_where(%Ecto.Query{} = query, counter) do
+    {sql, params} = render_sql(:all, query, counter)
 
     {before_where, after_where} = split_sql_keyword!(sql, "WHERE")
 
@@ -523,4 +517,46 @@ defmodule AshPostgres.Merge do
   @doc false
   def quote_table(nil, table), do: quote_name(table)
   def quote_table(prefix, table), do: "#{quote_name(prefix)}.#{quote_name(table)}"
+
+  # These statements are rendered only so their text can be spliced into a
+  # larger `MERGE` or `INSERT ... ON CONFLICT` statement; none of them is ever
+  # executed on its own.
+  #
+  # `Ecto.Adapters.SQL.to_sql/4` is therefore the wrong tool. It resolves the
+  # repository through `Ecto.Repo.Registry`, which raises for a library repo
+  # that the host has not started, and it dispatches through whatever adapter
+  # that repository is configured with. An adapter that wraps
+  # `Ecto.Adapters.Postgres` is free to rewrite the statement it prepares --
+  # `Phoenix.Sync`'s test sandbox, for one, injects an old-row join and extra
+  # `RETURNING` columns into every `update_all` so it can capture replication
+  # values -- and that rewritten text is not valid inside `ON CONFLICT DO
+  # UPDATE`. `to_sql/4` also returns the adapter's raw iodata whenever the
+  # query cache misses, while every caller below parses the statement as a
+  # string.
+  #
+  # Planning and rendering against `Ecto.Adapters.Postgres` directly needs no
+  # repository at all, keeps the `$n` placeholder offset callers depend on, and
+  # yields the canonical PostgreSQL text regardless of how the host repository
+  # is wired.
+  @render_adapter Ecto.Adapters.Postgres
+
+  @doc false
+  @spec render_sql(:all | :update_all, Ecto.Queryable.t(), non_neg_integer()) ::
+          {String.t(), [term()]}
+  def render_sql(kind, queryable, counter) do
+    {query, params, _key} =
+      queryable
+      |> Ecto.Queryable.to_query()
+      |> Ecto.Query.Planner.ensure_select(kind == :all)
+      |> Ecto.Query.Planner.plan(kind, @render_adapter)
+
+    {_cast_params, dump_params} = Enum.unzip(params)
+
+    {query, _select} = Ecto.Query.Planner.normalize(query, kind, @render_adapter, counter)
+
+    {kind |> render_statement(query) |> IO.iodata_to_binary(), dump_params}
+  end
+
+  defp render_statement(:all, query), do: @render_adapter.Connection.all(query)
+  defp render_statement(:update_all, query), do: @render_adapter.Connection.update_all(query)
 end
