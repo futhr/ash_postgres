@@ -19,6 +19,13 @@ defmodule AshPostgres.MigrationGenerator.OperationDeps do
   barrier would need it to run last — contradictory. Give each operation
   type the ordering it needs via `requires/1` instead.
 
+  Operations flagged `no_phase: true` float freely (they skip the create/alter
+  phases; see `group_into_phases/3`) unless `requires/1` gives them an edge. One
+  whose `up` SQL names an object another operation creates in the same batch must
+  require that object's fact, or it runs first. Only `AlterDeferrability` and
+  `AddPrimaryKey` do; the rest act on pre-existing objects, render nothing in
+  `up`, or are ordered by their facts' consumers.
+
   Requiring a fact waits on *every* operation that provides it, not just one
   — see `toposort_operations/1`'s `provides_index`. That's what makes
   `:table_structure_ready` works as a catch-all: many operation types provide
@@ -319,6 +326,13 @@ defmodule AshPostgres.MigrationGenerator.OperationDeps do
     end
   end
 
+  # sobelow_skip ["DOS.StringToAtom"]
+  defp temporal_key_columns(%{temporal: %{strategy: :context, attribute: attribute}})
+       when is_binary(attribute),
+       do: [String.to_atom(attribute)]
+
+  defp temporal_key_columns(_op), do: []
+
   defp structure_ready_facts(table, schema) do
     [{:table_structure_ready, key(table, schema)}]
   end
@@ -329,6 +343,21 @@ defmodule AshPostgres.MigrationGenerator.OperationDeps do
       %Operation.AddAttribute{table: table, schema: schema, attribute: attribute} ->
         [{:table_ready, key(table, schema)}] ++
           reference_requirements(attribute, table, schema)
+
+      # `ALTER CONSTRAINT ... DEFERRABLE` runs against a foreign key an `AddAttribute`
+      # in this batch creates (it provides `table_columns_settled`); without this it
+      # floats ahead and fails "constraint does not exist". `:down` drops it early_tier.
+      %Operation.AlterDeferrability{table: table, schema: schema, direction: :up} ->
+        [{:table_columns_settled, key(table, schema)}]
+
+      # `ADD PRIMARY KEY (keys)` runs against columns an `AddAttribute` in this batch can
+      # add (a new attribute folded into a composite key), so require each; without this
+      # it floats ahead of the add. Vacuous for pre-existing keys, and no cycle. On a
+      # temporal resource the key also covers the period column.
+      %Operation.AddPrimaryKey{table: table, schema: schema, keys: keys} = op ->
+        keys
+        |> Enum.concat(temporal_key_columns(op))
+        |> Enum.map(&{:column_ready, key(table, schema, &1)})
 
       %Operation.AlterAttribute{
         table: table,
@@ -524,6 +553,13 @@ defmodule AshPostgres.MigrationGenerator.OperationDeps do
 
         [{:table_structure_ready, key(own_table, schema)}] ++
           Enum.map(after_tables, &{:table_structure_ready, key(&1, schema)})
+
+      %Operation.AddTemporalForeignKey{} = op ->
+        # References the destination's temporal primary key, so both tables must be complete.
+        [
+          {:table_structure_ready, key(op.table, op.schema)},
+          {:table_structure_ready, key(op.destination_table, op.destination_schema)}
+        ]
 
       _ ->
         []

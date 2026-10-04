@@ -325,6 +325,7 @@ defmodule AshPostgres.MigrationGenerator do
                     |> Path.basename()
                     |> String.split("_#{opts.name}_extensions", parts: 2)
                     |> Enum.at(1)
+                    |> String.trim_leading("_")
                     |> Integer.parse()
                     |> case do
                       {integer, _} ->
@@ -349,6 +350,7 @@ defmodule AshPostgres.MigrationGenerator do
                     |> Path.basename()
                     |> String.split("_migrate_resources_extensions", parts: 2)
                     |> Enum.at(1)
+                    |> String.trim_leading("_")
                     |> Integer.parse()
                     |> case do
                       {integer, _} ->
@@ -1068,7 +1070,8 @@ defmodule AshPostgres.MigrationGenerator do
         | attributes: merge_attributes(attributes, snapshot.table, count_with_create),
           identities: snapshots |> Enum.flat_map(& &1.identities) |> Enum.uniq(),
           custom_indexes: snapshots |> Enum.flat_map(& &1.custom_indexes) |> Enum.uniq(),
-          custom_statements: snapshots |> Enum.flat_map(& &1.custom_statements) |> Enum.uniq()
+          custom_statements: snapshots |> Enum.flat_map(& &1.custom_statements) |> Enum.uniq(),
+          check_constraints: merge_check_constraints(snapshots, snapshot.table)
       }
 
       all_identities =
@@ -1106,6 +1109,61 @@ defmodule AshPostgres.MigrationGenerator do
         },
         existing_snapshot
       }
+    end)
+  end
+
+  defp merge_check_constraints(snapshots, table) do
+    constraints =
+      snapshots
+      |> Enum.flat_map(& &1.check_constraints)
+      |> Enum.uniq()
+
+    constraints
+    |> Enum.map(& &1.name)
+    |> Enum.uniq()
+    |> Enum.map(fn name ->
+      constraints
+      |> Enum.filter(&(&1.name == name))
+      |> case do
+        [constraint] ->
+          constraint
+
+        [constraint | _] = matching ->
+          case Enum.uniq_by(matching, & &1.check) do
+            [_] ->
+              :ok
+
+            conflicting ->
+              raise """
+              Conflicting check constraints named `#{name}` on table `#{table}`.
+
+              Multiple resources use this table and define a check constraint with this name, but with different checks:
+
+              #{Enum.map_join(conflicting, "\n", &"  * #{&1.check}")}
+
+              Check constraints on a shared table must agree on their `check`, or use different names.
+              """
+          end
+
+          base_filter =
+            if Enum.any?(matching, &is_nil(&1.base_filter)) do
+              nil
+            else
+              matching
+              |> Enum.map(& &1.base_filter)
+              |> Enum.uniq()
+              |> case do
+                [base_filter] -> base_filter
+                base_filters -> Enum.map_join(base_filters, " OR ", &"(#{&1})")
+              end
+            end
+
+          %{
+            constraint
+            | base_filter: base_filter,
+              attribute: matching |> Enum.flat_map(& &1.attribute) |> Enum.uniq()
+          }
+      end
     end)
   end
 
@@ -1174,8 +1232,16 @@ defmodule AshPostgres.MigrationGenerator do
           table: merge_uniq!(references, table, :table, name),
           schema: merge_uniq!(references, table, :schema, name)
         }
+        |> maybe_put_temporal_period(merge_uniq!(references, table, :temporal_period, name))
     end
   end
+
+  # Only include `temporal_period` when present, so non-temporal references keep
+  # their existing snapshot shape (no fixture churn).
+  defp maybe_put_temporal_period(reference, nil), do: reference
+
+  defp maybe_put_temporal_period(reference, temporal_period),
+    do: Map.put(reference, :temporal_period, temporal_period)
 
   defp to_map(nil), do: nil
   defp to_map(kw_list) when is_list(kw_list), do: Map.new(kw_list)
@@ -2301,6 +2367,13 @@ defmodule AshPostgres.MigrationGenerator do
           identity: identity,
           schema: snapshot.schema,
           table: snapshot.table,
+          temporal: snapshot.temporal,
+          citext_keys:
+            for(
+              %{source: source, type: :citext} <- snapshot.attributes,
+              source in identity.keys,
+              do: source
+            ),
           insert_after_attribute_source: insert_after_attribute_source,
           concurrently: opts.concurrent_indexes
         }
@@ -2309,9 +2382,7 @@ defmodule AshPostgres.MigrationGenerator do
     constraints_to_add =
       snapshot.check_constraints
       |> Enum.reject(fn constraint ->
-        Enum.find(old_snapshot.check_constraints, fn old_constraint ->
-          old_constraint.check == constraint.check && old_constraint.name == constraint.name
-        end)
+        Enum.find(old_snapshot.check_constraints, &check_constraints_match?(&1, constraint))
       end)
       |> Enum.map(fn constraint ->
         %Operation.AddCheckConstraint{
@@ -2324,9 +2395,7 @@ defmodule AshPostgres.MigrationGenerator do
     constraints_to_remove =
       old_snapshot.check_constraints
       |> Enum.reject(fn old_constraint ->
-        Enum.find(snapshot.check_constraints, fn constraint ->
-          old_constraint.check == constraint.check && old_constraint.name == constraint.name
-        end)
+        Enum.find(snapshot.check_constraints, &check_constraints_match?(old_constraint, &1))
       end)
       |> Enum.map(fn old_constraint ->
         %Operation.RemoveCheckConstraint{
@@ -2383,6 +2452,11 @@ defmodule AshPostgres.MigrationGenerator do
     |> Map.delete(:error_fields)
   end
 
+  defp check_constraints_match?(left, right) do
+    left.name == right.name && left.check == right.check &&
+      Map.get(left, :base_filter) == Map.get(right, :base_filter)
+  end
+
   @identity_match_keys [:name, :keys, :base_filter, :all_tenants?, :nils_distinct?, :where]
   defp identities_match?(left, right) do
     Map.take(left, @identity_match_keys) == Map.take(right, @identity_match_keys)
@@ -2405,7 +2479,37 @@ defmodule AshPostgres.MigrationGenerator do
 
   defp pkey_operations(snapshot, old_snapshot, attribute_operations, opts) do
     if old_snapshot[:empty?] do
-      {[], attribute_operations}
+      # Fresh table. A temporal resource needs a composite
+      # `(pk..., valid_at WITHOUT OVERLAPS)` primary key, which can't be expressed
+      # inline on a column — strip the inline pk and add it via AddPrimaryKey.
+      case snapshot.temporal do
+        %{strategy: :context, attribute: attribute} when is_binary(attribute) ->
+          keys =
+            Enum.flat_map(snapshot.attributes, fn attr ->
+              if attr.primary_key?, do: [attr.source], else: []
+            end)
+
+          stripped =
+            Enum.map(attribute_operations, fn
+              %Operation.AddAttribute{} = op ->
+                %{op | attribute: %{op.attribute | primary_key?: false}}
+
+              other ->
+                other
+            end)
+
+          {[
+             %Operation.AddPrimaryKey{
+               schema: snapshot.schema,
+               table: snapshot.table,
+               temporal: snapshot.temporal,
+               keys: keys
+             }
+           ], stripped}
+
+        _ ->
+          {[], attribute_operations}
+      end
     else
       must_drop_pkey? =
         Enum.any?(
@@ -2560,6 +2664,7 @@ defmodule AshPostgres.MigrationGenerator do
            %Operation.AddPrimaryKey{
              schema: snapshot.schema,
              table: snapshot.table,
+             temporal: snapshot.temporal,
              keys:
                Enum.flat_map(snapshot.attributes, fn attribute ->
                  if attribute.primary_key? do
@@ -2644,55 +2749,41 @@ defmodule AshPostgres.MigrationGenerator do
 
     add_attribute_events =
       Enum.flat_map(attributes_to_add, fn attribute ->
-        if attribute.references && has_reference?(snapshot.multitenancy, attribute) do
-          reference_ops =
-            if attribute.references.deferrable do
-              [
-                %Operation.AlterDeferrability{
-                  table: snapshot.table,
-                  schema: snapshot.schema,
-                  references: attribute.references,
-                  direction: :up
-                },
-                %Operation.AlterDeferrability{
-                  table: snapshot.table,
-                  schema: snapshot.schema,
-                  references: Map.get(attribute, :references),
-                  direction: :down
-                }
-              ]
-            else
-              []
-            end
+        cond do
+          temporal_period_reference?(attribute) ->
+            [source, destination] = attribute.references.temporal_period
+            reference = attribute.references
 
-          [
-            %Operation.AddAttribute{
-              attribute: Map.delete(attribute, :references),
-              schema: snapshot.schema,
-              table: snapshot.table
-            },
-            %Operation.AlterAttribute{
-              old_attribute: Map.delete(attribute, :references),
-              new_attribute: attribute,
-              schema: snapshot.schema,
-              table: snapshot.table
-            },
-            %Operation.DropForeignKey{
-              attribute: attribute,
-              table: snapshot.table,
-              schema: snapshot.schema,
-              multitenancy: Map.get(attribute, :multitenancy),
-              direction: :down
-            }
-          ] ++ reference_ops
-        else
-          [
-            %Operation.AddAttribute{
-              attribute: attribute,
-              table: snapshot.table,
-              schema: snapshot.schema
-            }
-          ]
+            [
+              %Operation.AddAttribute{
+                attribute: Map.delete(attribute, :references),
+                schema: snapshot.schema,
+                table: snapshot.table
+              },
+              %Operation.AddTemporalForeignKey{
+                schema: snapshot.schema,
+                table: snapshot.table,
+                name: reference.name,
+                column: attribute.source,
+                source_period: source,
+                destination_schema: reference.schema,
+                destination_table: reference.table,
+                destination_attribute: reference.destination_attribute,
+                destination_period: destination
+              }
+            ]
+
+          attribute.references && has_reference?(snapshot.multitenancy, attribute) ->
+            do_add_attribute_with_reference(attribute, snapshot)
+
+          true ->
+            [
+              %Operation.AddAttribute{
+                attribute: attribute,
+                table: snapshot.table,
+                schema: snapshot.schema
+              }
+            ]
         end
       end)
 
@@ -2806,6 +2897,56 @@ defmodule AshPostgres.MigrationGenerator do
 
     add_attribute_events ++
       alter_attribute_events ++ remove_attribute_events ++ rename_attribute_events
+  end
+
+  defp temporal_period_reference?(%{references: %{temporal_period: [source, destination]}})
+       when not is_nil(source) and not is_nil(destination),
+       do: true
+
+  defp temporal_period_reference?(_), do: false
+
+  # The standard reference-splitting path (column + AlterAttribute references + DropForeignKey).
+  defp do_add_attribute_with_reference(attribute, snapshot) do
+    reference_ops =
+      if attribute.references.deferrable do
+        [
+          %Operation.AlterDeferrability{
+            table: snapshot.table,
+            schema: snapshot.schema,
+            references: attribute.references,
+            direction: :up
+          },
+          %Operation.AlterDeferrability{
+            table: snapshot.table,
+            schema: snapshot.schema,
+            references: Map.get(attribute, :references),
+            direction: :down
+          }
+        ]
+      else
+        []
+      end
+
+    [
+      %Operation.AddAttribute{
+        attribute: Map.delete(attribute, :references),
+        schema: snapshot.schema,
+        table: snapshot.table
+      },
+      %Operation.AlterAttribute{
+        old_attribute: Map.delete(attribute, :references),
+        new_attribute: attribute,
+        schema: snapshot.schema,
+        table: snapshot.table
+      },
+      %Operation.DropForeignKey{
+        attribute: attribute,
+        table: snapshot.table,
+        schema: snapshot.schema,
+        multitenancy: Map.get(attribute, :multitenancy),
+        direction: :down
+      }
+    ] ++ reference_ops
   end
 
   defp with_serial_sequence_cleanup(%Operation.AlterAttribute{} = operation) do
@@ -3745,6 +3886,7 @@ defmodule AshPostgres.MigrationGenerator do
       custom_statements: custom_statements(resource),
       repo: AshPostgres.DataLayer.Info.repo(resource, :mutate),
       multitenancy: multitenancy(resource),
+      temporal: temporal(resource),
       base_filter: AshPostgres.DataLayer.Info.base_filter_sql(resource),
       has_create_action: has_create_action?(resource),
       create_table_options: AshPostgres.DataLayer.Info.create_table_options(resource)
@@ -3834,6 +3976,21 @@ defmodule AshPostgres.MigrationGenerator do
     }
   end
 
+  defp temporal(resource) do
+    case Ash.Resource.Info.temporal_strategy(resource) do
+      nil ->
+        nil
+
+      strategy ->
+        attribute = Ash.Resource.Info.temporal_attribute(resource)
+
+        %{
+          strategy: strategy,
+          attribute: attribute && to_string(attribute)
+        }
+    end
+  end
+
   defp attributes(resource, table) do
     repo = AshPostgres.DataLayer.Info.repo(resource, :mutate)
     ignored = AshPostgres.DataLayer.Info.migration_ignore_attributes(resource) || []
@@ -3856,9 +4013,25 @@ defmodule AshPostgres.MigrationGenerator do
     |> Enum.map(fn attribute ->
       default = default(attribute, resource, repo)
 
+      migration_type_override =
+        AshPostgres.DataLayer.Info.migration_types(resource)[attribute.name]
+
       type =
-        AshPostgres.DataLayer.Info.migration_types(resource)[attribute.name] ||
+        migration_type_override ||
           migration_type(attribute.type, attribute.constraints)
+
+      type =
+        if is_nil(migration_type_override) &&
+             function_exported?(repo, :use_timestamptz?, 0) &&
+             repo.use_timestamptz?() do
+          case type do
+            :utc_datetime -> :timestamptz
+            :utc_datetime_usec -> :"timestamptz(6)"
+            type -> type
+          end
+        else
+          type
+        end
 
       type =
         if function_exported?(repo, :override_migration_type, 1) do
@@ -3975,9 +4148,28 @@ defmodule AshPostgres.MigrationGenerator do
               relationship.context[:data_layer][:table] ||
                 AshPostgres.DataLayer.Info.table(relationship.destination)
           }
+          |> with_temporal_period(relationship)
         end
       end
     end)
+  end
+
+  # Temporal foreign keys reference a period: `FOREIGN KEY (fk, PERIOD src_valid_at)
+  # REFERENCES dest (dest_pk, PERIOD dest_valid_at)`. When only one side is temporal
+  # (`temporal_keys` has a nil element) there is no enforceable DB foreign key, so the
+  # reference is dropped (the relationship is logical-only, resolved at read time).
+  defp with_temporal_period(reference, relationship) do
+    case Map.get(relationship, :temporal_keys) do
+      {source, destination} when not is_nil(source) and not is_nil(destination) ->
+        # Stored as a list (not a tuple) so it survives snapshot JSON round-trips.
+        Map.put(reference, :temporal_period, [to_string(source), to_string(destination)])
+
+      {_, _} ->
+        nil
+
+      _ ->
+        reference
+    end
   end
 
   defp reference_index_where(:not_nil, source), do: "#{source} IS NOT NULL"
@@ -4312,8 +4504,15 @@ defmodule AshPostgres.MigrationGenerator do
     |> Map.update!(:custom_indexes, &load_custom_indexes/1)
     |> Map.put_new(:custom_statements, [])
     |> Map.update!(:custom_statements, &load_custom_statements/1)
+    |> Map.put_new(:base_filter, nil)
     |> Map.put_new(:check_constraints, [])
-    |> Map.update!(:check_constraints, &load_check_constraints/1)
+    |> then(fn snapshot ->
+      Map.update!(
+        snapshot,
+        :check_constraints,
+        &load_check_constraints(&1, snapshot.base_filter)
+      )
+    end)
     |> Map.update!(:repo, &maybe_to_atom/1)
     |> Map.put_new(:multitenancy, %{
       attribute: nil,
@@ -4321,13 +4520,25 @@ defmodule AshPostgres.MigrationGenerator do
       global: nil
     })
     |> Map.update!(:multitenancy, &load_multitenancy/1)
-    |> Map.put_new(:base_filter, nil)
+    |> Map.put_new(:temporal, nil)
+    |> Map.update!(:temporal, &load_temporal/1)
     |> Map.put_new(:drop_table_opted_out, false)
   end
 
-  defp load_check_constraints(constraints) do
+  defp load_temporal(nil), do: nil
+
+  defp load_temporal(temporal) do
+    %{
+      strategy: maybe_to_atom(temporal[:strategy] || temporal["strategy"]),
+      attribute: temporal[:attribute] || temporal["attribute"]
+    }
+  end
+
+  defp load_check_constraints(constraints, snapshot_base_filter) do
     Enum.map(constraints, fn constraint ->
-      Map.update!(constraint, :attribute, fn attribute ->
+      constraint
+      |> Map.put_new(:base_filter, snapshot_base_filter)
+      |> Map.update!(:attribute, fn attribute ->
         attribute
         |> List.wrap()
         |> Enum.map(&maybe_to_atom/1)

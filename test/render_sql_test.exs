@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: MIT
 
 defmodule AshPostgres.Test.RenderSqlTest do
+  @moduledoc false
+
   use AshPostgres.RepoCase, async: true
 
   import Ecto.Query

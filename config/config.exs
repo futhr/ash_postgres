@@ -51,7 +51,7 @@ if Mix.env() == :test do
     username: System.get_env("PGUSER", "postgres"),
     database: System.get_env("PGDATABASE", "ash_postgres_test"),
     hostname: System.get_env("PGHOST", "localhost"),
-    port: String.to_integer(System.get_env("PGPORT", "5432")),
+    port: String.to_integer(System.get_env("PGPORT", "5433")),
     pool: Ecto.Adapters.SQL.Sandbox,
     types: AshPostgres.Test.PostgrexTypes
 
@@ -60,7 +60,7 @@ if Mix.env() == :test do
     password: System.get_env("PGPASSWORD", "postgres"),
     database: System.get_env("PGDEV_DATABASE", "ash_postgres_dev_test"),
     hostname: System.get_env("PGHOST", "localhost"),
-    port: String.to_integer(System.get_env("PGPORT", "5432")),
+    port: String.to_integer(System.get_env("PGPORT", "5433")),
     migration_primary_key: [name: :id, type: :binary_id],
     pool: Ecto.Adapters.SQL.Sandbox
 
@@ -73,7 +73,7 @@ if Mix.env() == :test do
     username: System.get_env("PGUSER", "postgres"),
     database: System.get_env("PGDATABASE", "ash_postgres_test"),
     hostname: System.get_env("PGHOST", "localhost"),
-    port: String.to_integer(System.get_env("PGPORT", "5432"))
+    port: String.to_integer(System.get_env("PGPORT", "5433"))
 
   # sobelow_skip ["Config.Secrets"]
   config :ash_postgres, AshPostgres.TestNoSandboxRepo,
@@ -90,7 +90,8 @@ if Mix.env() == :test do
       AshPostgres.Test.ComplexCalculations.Domain,
       AshPostgres.Test.MultiDomainCalculations.DomainOne,
       AshPostgres.Test.MultiDomainCalculations.DomainTwo,
-      AshPostgres.Test.MultiDomainCalculations.DomainThree
+      AshPostgres.Test.MultiDomainCalculations.DomainThree,
+      AshPostgres.Test.Temporal.Domain
     ]
 
   config :ash, :compatible_foreign_key_types, [

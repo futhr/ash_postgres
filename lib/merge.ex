@@ -4,6 +4,7 @@
 
 defmodule AshPostgres.Merge do
   @moduledoc false
+
   # Builds and executes PostgreSQL `MERGE` statements, used to implement `update_many`: many
   # heterogeneous updates in a single statement, each row of the `USING` source updating the
   # target row it matches. Both `MERGE ... RETURNING` and `merge_action()` require PostgreSQL 17,
@@ -518,26 +519,9 @@ defmodule AshPostgres.Merge do
   def quote_table(nil, table), do: quote_name(table)
   def quote_table(prefix, table), do: "#{quote_name(prefix)}.#{quote_name(table)}"
 
-  # These statements are rendered only so their text can be spliced into a
-  # larger `MERGE` or `INSERT ... ON CONFLICT` statement; none of them is ever
-  # executed on its own.
-  #
-  # `Ecto.Adapters.SQL.to_sql/4` is therefore the wrong tool. It resolves the
-  # repository through `Ecto.Repo.Registry`, which raises for a library repo
-  # that the host has not started, and it dispatches through whatever adapter
-  # that repository is configured with. An adapter that wraps
-  # `Ecto.Adapters.Postgres` is free to rewrite the statement it prepares --
-  # `Phoenix.Sync`'s test sandbox, for one, injects an old-row join and extra
-  # `RETURNING` columns into every `update_all` so it can capture replication
-  # values -- and that rewritten text is not valid inside `ON CONFLICT DO
-  # UPDATE`. `to_sql/4` also returns the adapter's raw iodata whenever the
-  # query cache misses, while every caller below parses the statement as a
-  # string.
-  #
-  # Planning and rendering against `Ecto.Adapters.Postgres` directly needs no
-  # repository at all, keeps the `$n` placeholder offset callers depend on, and
-  # yields the canonical PostgreSQL text regardless of how the host repository
-  # is wired.
+  # Render fragments with PostgreSQL directly: an embedded Repo may be unstarted,
+  # and a wrapping adapter may add joins or RETURNING clauses that cannot be
+  # spliced into an upsert. Keep placeholder offsets and normalize iodata to text.
   @render_adapter Ecto.Adapters.Postgres
 
   @doc false

@@ -3,11 +3,15 @@
 # SPDX-License-Identifier: MIT
 
 defmodule AshPostgres.Test.DynamicRepoSqlTest do
+  @moduledoc false
+
   use AshPostgres.RepoCase, async: false
 
   alias AshPostgres.Test.Post
 
   defmodule EmbeddedRepo do
+    @moduledoc false
+
     use Ecto.Repo,
       otp_app: :ash_postgres,
       adapter: Ecto.Adapters.Postgres,

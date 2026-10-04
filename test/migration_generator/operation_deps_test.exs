@@ -57,6 +57,39 @@ defmodule AshPostgres.MigrationGenerator.OperationDepsTest do
     end
   end
 
+  describe "temporal primary key" do
+    test "a temporal primary key waits for its period column, as well as its key columns" do
+      add_key = %Operation.AddAttribute{
+        table: "posts",
+        schema: nil,
+        attribute: %{source: :id, primary_key?: true}
+      }
+
+      add_period = %Operation.AddAttribute{
+        table: "posts",
+        schema: nil,
+        attribute: %{source: :valid_at, primary_key?: false}
+      }
+
+      # The period attribute is loaded from the snapshot as a string
+      primary_key = %Operation.AddPrimaryKey{
+        table: "posts",
+        schema: nil,
+        keys: [:id],
+        temporal: %{strategy: :context, attribute: "valid_at"}
+      }
+
+      required = OperationDeps.requires(primary_key)
+
+      for column <- [add_key, add_period] do
+        [column_ready_fact] =
+          OperationDeps.provides(column) |> Enum.filter(&match?({:column_ready, _}, &1))
+
+        assert column_ready_fact in required
+      end
+    end
+  end
+
   describe "cross-table structural FK" do
     test "an AddAttribute with a structural reference is satisfied by the referenced table's column and unique index" do
       referenced_column = %Operation.AddAttribute{
@@ -807,6 +840,98 @@ defmodule AshPostgres.MigrationGenerator.OperationDepsTest do
         |> Enum.filter(&match?({:column_fk_dropped, _}, &1))
 
       assert fact in OperationDeps.requires(remove_index)
+    end
+  end
+
+  describe "foreign key deferrability" do
+    test "AlterDeferrability{direction: :up} requires table_columns_settled, satisfied by the AddAttribute that adds the foreign key it alters" do
+      alter_def = %Operation.AlterDeferrability{
+        table: "comments",
+        schema: nil,
+        references: %{},
+        direction: :up
+      }
+
+      add_fk_column = %Operation.AddAttribute{
+        table: "comments",
+        schema: nil,
+        attribute: %{
+          source: :post_id,
+          primary_key?: false,
+          references: %{table: "posts", destination_attribute: :id, schema: "public"}
+        }
+      }
+
+      [settled_fact] =
+        OperationDeps.provides(add_fk_column)
+        |> Enum.filter(&match?({:table_columns_settled, _}, &1))
+
+      assert settled_fact == {:table_columns_settled, {"public", "comments"}}
+      assert settled_fact in OperationDeps.requires(alter_def)
+    end
+
+    test "AlterDeferrability{direction: :up} is ordered after the AddAttribute that creates the foreign key" do
+      add_fk_column = %Operation.AddAttribute{
+        table: "comments",
+        schema: nil,
+        attribute: %{
+          source: :post_id,
+          primary_key?: false,
+          references: %{table: "posts", destination_attribute: :id, schema: "public"}
+        }
+      }
+
+      alter_def = %Operation.AlterDeferrability{
+        table: "comments",
+        schema: nil,
+        references: %{},
+        direction: :up
+      }
+
+      # Alter listed first on purpose: only the dependency edge can reorder it.
+      operations = MigrationGenerator.toposort_operations([alter_def, add_fk_column])
+
+      add_index = Enum.find_index(operations, &match?(%Operation.AddAttribute{}, &1))
+      def_index = Enum.find_index(operations, &match?(%Operation.AlterDeferrability{}, &1))
+
+      assert add_index < def_index
+    end
+  end
+
+  describe "primary key columns" do
+    test "AddPrimaryKey requires column_ready for each key, satisfied by the AddAttribute that adds a new composite-pkey column" do
+      # Widening the primary key to include a newly added column (cell_id).
+      add_pk = %Operation.AddPrimaryKey{table: "accounts", schema: nil, keys: [:id, :cell_id]}
+
+      add_cell_id = %Operation.AddAttribute{
+        table: "accounts",
+        schema: nil,
+        attribute: %{source: :cell_id, primary_key?: true}
+      }
+
+      [column_ready_fact] =
+        OperationDeps.provides(add_cell_id) |> Enum.filter(&match?({:column_ready, _}, &1))
+
+      assert column_ready_fact == {:column_ready, {"public", "accounts", :cell_id}}
+      assert column_ready_fact in OperationDeps.requires(add_pk)
+    end
+
+    test "AddPrimaryKey is ordered after the AddAttribute that creates a new composite primary-key column" do
+      add_cell_id = %Operation.AddAttribute{
+        table: "accounts",
+        schema: nil,
+        attribute: %{source: :cell_id, primary_key?: true}
+      }
+
+      add_pk = %Operation.AddPrimaryKey{table: "accounts", schema: nil, keys: [:id, :cell_id]}
+
+      # AddPrimaryKey listed first on purpose: only the dependency edge can reorder it.
+      operations = MigrationGenerator.toposort_operations([add_pk, add_cell_id])
+
+      add_index = Enum.find_index(operations, &match?(%Operation.AddAttribute{}, &1))
+      pk_index = Enum.find_index(operations, &match?(%Operation.AddPrimaryKey{}, &1))
+
+      assert add_index < pk_index
     end
   end
 end

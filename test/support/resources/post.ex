@@ -166,6 +166,10 @@ defmodule AshPostgres.Test.Post do
 
     defaults([:read, :destroy])
 
+    read :sorted_by_title do
+      prepare(build(sort: [title: :asc]))
+    end
+
     read :with_version_check do
       argument(:version, :integer)
 
@@ -826,6 +830,12 @@ defmodule AshPostgres.Test.Post do
       filter(expr(likes > 10))
     end
 
+    has_many :comments_sorted_by_likes, AshPostgres.Test.Comment do
+      public?(true)
+      destination_attribute(:post_id)
+      sort(likes: :desc)
+    end
+
     has_many :comments_containing_title, AshPostgres.Test.Comment do
       public?(true)
       manual(AshPostgres.Test.Post.CommentsContainingTitle)
@@ -1008,6 +1018,12 @@ defmodule AshPostgres.Test.Post do
   end
 
   calculations do
+    calculate(
+      :count_of_comments_titled_by_actor_plus_one,
+      :integer,
+      expr(count_of_comments_titled_by_actor + 1)
+    )
+
     calculate :relevance_score,
               :integer,
               expr(
@@ -1341,6 +1357,10 @@ defmodule AshPostgres.Test.Post do
     sum(:sum_of_comment_ratings_calc, [:comments, :ratings], :double_score)
     count(:count_of_comments, :comments)
 
+    count :count_of_comments_titled_by_actor, :comments do
+      filter(expr(title == ^actor(:title)))
+    end
+
     count :count_of_comments_with_same_name, :comments do
       filter(expr(title == parent(title)))
     end
@@ -1416,6 +1436,15 @@ defmodule AshPostgres.Test.Post do
     list :uniq_comment_titles, :comments, :title do
       uniq?(true)
       sort(title: :asc_nils_last)
+    end
+
+    list :uniq_comment_titles_sorted_by_likes, :comments, :title do
+      uniq?(true)
+      sort(likes: :desc)
+    end
+
+    list :uniq_titles_of_comments_sorted_by_likes, :comments_sorted_by_likes, :title do
+      uniq?(true)
     end
 
     list(:comment_ids, :comments, :id)

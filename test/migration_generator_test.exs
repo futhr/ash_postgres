@@ -269,6 +269,146 @@ defmodule AshPostgres.MigrationGeneratorTest do
     end
   end
 
+  defmodule TimestamptzToggleRepo do
+    use AshPostgres.Repo,
+      otp_app: :ash_postgres
+
+    def use_timestamptz?, do: true
+
+    def min_pg_version do
+      %Version{major: 16, minor: 0, patch: 0}
+    end
+  end
+
+  defmodule TimestamptzPost do
+    use Ash.Resource,
+      domain: nil,
+      data_layer: AshPostgres.DataLayer
+
+    postgres do
+      table "timestamptz_posts"
+      repo TimestamptzToggleRepo
+      migration_types(explicit_type: :utc_datetime)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:starts_at, :datetime, public?: true)
+      attribute(:explicit_type, :datetime, public?: true)
+    end
+
+    actions do
+      create :create do
+        accept([:starts_at])
+      end
+
+      read :read do
+        primary?(true)
+      end
+    end
+  end
+
+  defmodule TimestamptzDomain do
+    use Ash.Domain
+
+    resources do
+      resource(TimestamptzPost)
+    end
+  end
+
+  describe "timestamptz datetime toggle" do
+    setup %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      {:ok, _pid} =
+        TimestamptzToggleRepo.start_link(
+          username: "postgres",
+          password: "postgres",
+          database: "ash_postgres_test",
+          hostname: "localhost",
+          pool: Ecto.Adapters.SQL.Sandbox,
+          types: AshPostgres.Test.PostgrexTypes
+        )
+
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(TimestamptzToggleRepo)
+
+      Ecto.Adapters.SQL.Sandbox.mode(
+        TimestamptzToggleRepo,
+        {:shared, self()}
+      )
+
+      Ecto.Adapters.SQL.query!(
+        TimestamptzToggleRepo,
+        """
+        CREATE TABLE timestamptz_posts (
+          id uuid PRIMARY KEY,
+          starts_at timestamptz,
+          explicit_type timestamp without time zone
+        )
+        """
+      )
+
+      assert AshPostgres.SqlImplementation.storage_type(
+               TimestamptzPost,
+               :starts_at
+             ) == nil
+
+      AshPostgres.MigrationGenerator.generate(
+        TimestamptzDomain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      {:ok, timestamptz_post: TimestamptzPost}
+    end
+
+    test "uses timestamptz for :datetime when enabled", %{
+      migration_path: migration_path
+    } do
+      files =
+        Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+        |> Enum.reject(&String.contains?(&1, "extensions"))
+
+      assert [file] = files
+
+      file_contents = File.read!(file)
+
+      assert file_contents =~ ~S[add :starts_at, :timestamptz]
+      assert file_contents =~ ~S[add :explicit_type, :utc_datetime]
+    end
+
+    test "uses timestamptz Ecto type when enabled", %{timestamptz_post: resource} do
+      assert resource.__schema__(:type, :starts_at) ==
+               {:parameterized,
+                {AshPostgres.Timestamptz.EctoType,
+                 [precision: :second, cast_dates_as: :start_of_day, timezone: :utc]}}
+    end
+
+    test "preserves datetime across database timezone changes", %{
+      timestamptz_post: resource
+    } do
+      datetime = ~U[2026-01-15 12:00:00Z]
+
+      post =
+        resource
+        |> Ash.Changeset.for_create(:create, %{starts_at: datetime}, domain: TimestamptzDomain)
+        |> Ash.create!()
+
+      {:ok, _result} =
+        Ecto.Adapters.SQL.query(
+          TimestamptzToggleRepo,
+          "SET timezone = 'America/Los_Angeles'"
+        )
+
+      loaded =
+        resource
+        |> Ash.get!(post.id, domain: TimestamptzDomain)
+
+      assert DateTime.compare(loaded.starts_at, datetime) == :eq
+    end
+  end
+
   describe "get_operations_from_snapshots" do
     test "explicit fk attribute order does not change create table emission" do
       # This also reproduces if a non-identity attribute like :note appears between
@@ -465,12 +605,22 @@ defmodule AshPostgres.MigrationGeneratorTest do
       prev_pg_version_env = System.fetch_env("PG_VERSION")
       System.put_env("PG_VERSION", "18")
 
+      # TestRepo defaults `use_builtin_uuidv7_function?` to false (to avoid
+      # snapshot churn at min_pg_version 19); opt into the native function here.
+      prev_use_builtin = Application.get_env(:ash_postgres, :test_use_builtin_uuidv7?)
+      Application.put_env(:ash_postgres, :test_use_builtin_uuidv7?, true)
+
       on_exit(fn ->
         case prev_pg_version_env do
           # there was a previous env var set, restore it
           {:ok, value} -> System.put_env("PG_VERSION", value)
           # there was nothing set, delete what we set
           :error -> System.delete_env("PG_VERSION")
+        end
+
+        case prev_use_builtin do
+          nil -> Application.delete_env(:ash_postgres, :test_use_builtin_uuidv7?)
+          value -> Application.put_env(:ash_postgres, :test_use_builtin_uuidv7?, value)
         end
       end)
 
@@ -4537,6 +4687,361 @@ defmodule AshPostgres.MigrationGeneratorTest do
       assert File.read!(file) =~
                ~S[drop_if_exists constraint(:posts, :price_must_be_positive)]
     end
+
+    test "when multiple resources share a table, a constraint named without `check` on the first resource does not drop the constraint",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      # The subtype only names the constraint (for the error mapping) and is declared first
+      defposts TextPost do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        resource do
+          base_filter(expr(kind == "text"))
+        end
+
+        postgres do
+          base_filter_sql "kind = 'text'"
+
+          check_constraints do
+            check_constraint(:body, "text_has_body", message: "text notes need a body")
+          end
+        end
+      end
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        postgres do
+          check_constraints do
+            check_constraint(:body, "text_has_body", check: "kind <> 'text' OR body IS NOT NULL")
+          end
+        end
+      end
+
+      defdomain([TextPost, Post])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert file =
+               "#{migration_path}/**/*_migrate_resources*.exs"
+               |> Path.wildcard()
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+               |> Enum.sort()
+               |> Enum.at(0)
+               |> File.read!()
+
+      assert file =~
+               ~S'''
+               create constraint(:posts, :text_has_body, check: """
+                 kind <> 'text' OR body IS NOT NULL
+               """)
+               '''
+    end
+
+    test "when multiple resources share a table, a constraint defined without a base filter is not wrapped in another resource's base filter",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts TextPost do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        resource do
+          base_filter(expr(kind == "text"))
+        end
+
+        postgres do
+          base_filter_sql "kind = 'text'"
+
+          check_constraints do
+            check_constraint(:body, "text_has_body", check: "kind <> 'text' OR body IS NOT NULL")
+          end
+        end
+      end
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        postgres do
+          check_constraints do
+            check_constraint(:body, "text_has_body", check: "kind <> 'text' OR body IS NOT NULL")
+          end
+        end
+      end
+
+      defdomain([TextPost, Post])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert file =
+               "#{migration_path}/**/*_migrate_resources*.exs"
+               |> Path.wildcard()
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+               |> Enum.sort()
+               |> Enum.at(0)
+               |> File.read!()
+
+      assert file =~
+               ~S'''
+               create constraint(:posts, :text_has_body, check: """
+                 kind <> 'text' OR body IS NOT NULL
+               """)
+               '''
+
+      refute file =~ "OR NOT"
+    end
+
+    test "when multiple resources share a table and define the same constraint under different base filters, the base filters are combined",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts TextPost do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        resource do
+          base_filter(expr(kind == "text"))
+        end
+
+        postgres do
+          base_filter_sql "kind = 'text'"
+
+          check_constraints do
+            check_constraint(:body, "has_body", check: "body IS NOT NULL")
+          end
+        end
+      end
+
+      defposts FlagPost do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:kind, :string, public?: true)
+          attribute(:body, :string, public?: true)
+        end
+
+        resource do
+          base_filter(expr(kind == "flag"))
+        end
+
+        postgres do
+          base_filter_sql "kind = 'flag'"
+
+          check_constraints do
+            check_constraint(:body, "has_body", check: "body IS NOT NULL")
+          end
+        end
+      end
+
+      defdomain([TextPost, FlagPost])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert file =
+               "#{migration_path}/**/*_migrate_resources*.exs"
+               |> Path.wildcard()
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+               |> Enum.sort()
+               |> Enum.at(0)
+               |> File.read!()
+
+      assert file =~
+               ~S'''
+               create constraint(:posts, :has_body, check: """
+                 (body IS NOT NULL) OR NOT ((kind = 'text') OR (kind = 'flag'))
+               """)
+               '''
+    end
+
+    test "when multiple resources share a table and define conflicting checks under the same constraint name, it raises",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts TextPost do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:body, :string, public?: true)
+        end
+
+        postgres do
+          check_constraints do
+            check_constraint(:body, "has_body", check: "body IS NOT NULL")
+          end
+        end
+      end
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:body, :string, public?: true)
+        end
+
+        postgres do
+          check_constraints do
+            check_constraint(:body, "has_body", check: "body <> ''")
+          end
+        end
+      end
+
+      defdomain([TextPost, Post])
+
+      assert_raise RuntimeError, ~r/conflicting check constraints named `has_body`/i, fn ->
+        AshPostgres.MigrationGenerator.generate(Domain,
+          snapshot_path: snapshot_path,
+          migration_path: migration_path,
+          quiet: true,
+          format: false,
+          auto_name: true
+        )
+      end
+    end
+
+    test "when a constraint with a base filter is removed, the down recreates it composed with the base filter",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:price, :integer, public?: true)
+        end
+
+        postgres do
+          base_filter_sql "price > -10"
+
+          check_constraints do
+            check_constraint(:price, "price_must_be_positive", check: "price > 0")
+          end
+        end
+      end
+
+      defdomain([Post])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:price, :integer, public?: true)
+        end
+
+        postgres do
+          base_filter_sql "price > -10"
+        end
+      end
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert file =
+               "#{migration_path}/**/*_migrate_resources*.exs"
+               |> Path.wildcard()
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+               |> Enum.sort()
+               |> Enum.at(1)
+               |> File.read!()
+
+      assert file =~ ~S[drop_if_exists constraint(:posts, :price_must_be_positive)]
+
+      assert file =~
+               ~S'''
+               create constraint(:posts, :price_must_be_positive, check: """
+                 (price > 0) OR NOT (price > -10)
+               """)
+               '''
+
+      refute file =~ "price > -10 AND price > 0"
+    end
+
+    test "when an existing snapshot has no base filter recorded on a constraint, it is not recreated",
+         %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:price, :integer, public?: true)
+        end
+
+        postgres do
+          base_filter_sql "price > -10"
+
+          check_constraints do
+            check_constraint(:price, "price_must_be_positive", check: "price > 0")
+          end
+        end
+      end
+
+      defdomain([Post])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      # Simulate a snapshot written before constraints recorded their base filter
+      [snapshot_file] = Path.wildcard("#{snapshot_path}/**/posts/*.json")
+
+      snapshot_file
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.update!("check_constraints", fn constraints ->
+        Enum.map(constraints, &Map.delete(&1, "base_filter"))
+      end)
+      |> Jason.encode!(pretty: true)
+      |> then(&File.write!(snapshot_file, &1))
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [_] =
+               "#{migration_path}/**/*_migrate_resources*.exs"
+               |> Path.wildcard()
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+    end
   end
 
   describe "polymorphic resources" do
@@ -7552,6 +8057,54 @@ defmodule AshPostgres.MigrationGeneratorTest do
 
       assert output =~ "No changes detected"
       assert output =~ "Some resources have `migrate?` set to `false` and were skipped"
+    end
+  end
+
+  describe "extension migration numbering" do
+    setup %{snapshot_path: snapshot_path, migration_path: migration_path} do
+      # simulate an existing extensions migration from a previous run
+      File.mkdir_p!(migration_path)
+
+      File.write!(
+        Path.join(migration_path, "20200101000000_migrate_resources_extensions_1.exs"),
+        "# placeholder"
+      )
+
+      defposts do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defdomain([Post])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      :ok
+    end
+
+    test "a new extensions migration increments past the existing one", %{
+      migration_path: migration_path
+    } do
+      # the test config shares one migration path across all test repos, so one
+      # extensions migration is generated per repo. Each must be numbered past
+      # the pre-existing `_1` rather than colliding with it.
+      new_files =
+        Path.wildcard("#{migration_path}/**/*_migrate_resources_extensions_*.exs")
+        |> Enum.reject(&String.starts_with?(Path.basename(&1), "20200101000000_"))
+
+      assert new_files != []
+
+      for file <- new_files do
+        assert Path.basename(file) =~ ~r/^\d+_migrate_resources_extensions_2\.exs$/
+        assert File.read!(file) =~ "MigrateResourcesExtensions2 do"
+      end
     end
   end
 end
