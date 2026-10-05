@@ -192,7 +192,9 @@ defmodule AshPostgres.Merge do
       end)
 
     {values_sql, values_params} =
-      Ecto.Adapters.SQL.to_sql(:all, repo, from(v in values(rows, types)), counter: 0)
+      Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), from(v in values(rows, types)),
+        counter: 0
+      )
 
     {values_sql, values_params}
   end
@@ -276,7 +278,9 @@ defmodule AshPostgres.Merge do
     do: {" WHEN MATCHED THEN DO NOTHING", [], nil}
 
   defp build_when_matched(repo, %Ecto.Query{} = set_query, cond_sql, counter) do
-    {sql, params} = Ecto.Adapters.SQL.to_sql(:update_all, repo, set_query, counter: counter)
+    {sql, params} =
+      Ecto.Adapters.SQL.to_sql(:update_all, repo.get_dynamic_repo(), set_query, counter: counter)
+
     {target_alias, set_clause} = extract_set_clause(sql)
 
     cond_part = if cond_sql, do: [" AND ", cond_sql], else: []
@@ -376,7 +380,9 @@ defmodule AshPostgres.Merge do
   defp render_optional_where(_repo, nil, counter), do: {nil, [], counter, nil}
 
   defp render_optional_where(repo, %Ecto.Query{} = query, counter) do
-    {sql, params} = Ecto.Adapters.SQL.to_sql(:all, repo, query, counter: counter)
+    {sql, params} =
+      Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), query, counter: counter)
+
     {before_where, after_where} = split_sql_keyword!(sql, "WHERE")
 
     pred =

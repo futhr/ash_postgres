@@ -175,7 +175,7 @@ defmodule AshPostgres.Upsert do
 
               {:ok, %Ecto.Query{} = query} ->
                 {sql, query_params} =
-                  Ecto.Adapters.SQL.to_sql(:all, repo, query, counter: counter)
+                  Ecto.Adapters.SQL.to_sql(:all, repo.get_dynamic_repo(), query, counter: counter)
 
                 {["(", sql, ")"], {[query_params | params], counter + length(query_params)}}
 
@@ -212,7 +212,9 @@ defmodule AshPostgres.Upsert do
   defp build_on_conflict(repo, resource, %Ecto.Query{} = query, conflict_target, prefix, counter) do
     query = if prefix, do: %{query | prefix: prefix}, else: query
 
-    {sql, params} = Ecto.Adapters.SQL.to_sql(:update_all, repo, query, counter: counter)
+    {sql, params} =
+      Ecto.Adapters.SQL.to_sql(:update_all, repo.get_dynamic_repo(), query, counter: counter)
+
     {before_set, set_and_where} = split_sql_keyword!(sql, "SET")
 
     on_conflict_sql = [

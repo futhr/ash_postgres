@@ -48,47 +48,48 @@ if Mix.env() == :test do
     AshPostgres.Test.OperatorExpression.IntListType
   ]
 
-  pg_port = String.to_integer(System.get_env("PG_PORT", "5432"))
+  pg_port = String.to_integer(System.get_env("PGPORT", System.get_env("PG_PORT", "5432")))
 
   config :ash_postgres, AshPostgres.TestRepo,
-    username: "postgres",
-    database: "ash_postgres_test",
-    hostname: "localhost",
+    username: System.get_env("PGUSER", "postgres"),
+    database: System.get_env("PGDATABASE", "ash_postgres_test"),
+    hostname: System.get_env("PGHOST", "localhost"),
     port: pg_port,
     pool: Ecto.Adapters.SQL.Sandbox,
     types: AshPostgres.Test.PostgrexTypes
 
   config :ash_postgres, AshPostgres.DevTestRepo,
-    username: "postgres",
-    password: "postgres",
-    database: "ash_postgres_dev_test",
-    hostname: "localhost",
+    username: System.get_env("PGUSER", "postgres"),
+    password: System.get_env("PGPASSWORD", "postgres"),
+    database: System.get_env("PGDEV_DATABASE", "ash_postgres_dev_test"),
+    hostname: System.get_env("PGHOST", "localhost"),
     port: pg_port,
     migration_primary_key: [name: :id, type: :binary_id],
     pool: Ecto.Adapters.SQL.Sandbox
 
   # sobelow_skip ["Config.Secrets"]
-  config :ash_postgres, AshPostgres.TestRepo, password: "postgres"
+  config :ash_postgres, AshPostgres.TestRepo, password: System.get_env("PGPASSWORD", "postgres")
 
   config :ash_postgres, AshPostgres.TestRepo, migration_primary_key: [name: :id, type: :binary_id]
 
   config :ash_postgres, AshPostgres.TestNoSandboxRepo,
-    username: "postgres",
-    database: "ash_postgres_test",
-    hostname: "localhost",
+    username: System.get_env("PGUSER", "postgres"),
+    database: System.get_env("PGDATABASE", "ash_postgres_test"),
+    hostname: System.get_env("PGHOST", "localhost"),
     port: pg_port
 
   # sobelow_skip ["Config.Secrets"]
-  config :ash_postgres, AshPostgres.TestNoSandboxRepo, password: "postgres"
+  config :ash_postgres, AshPostgres.TestNoSandboxRepo,
+    password: System.get_env("PGPASSWORD", "postgres")
 
   config :ash_postgres, AshPostgres.TestNoSandboxRepo,
     migration_primary_key: [name: :id, type: :binary_id]
 
   config :ash_postgres, AshPostgres.TemporalTestRepo,
-    username: "postgres",
-    password: "postgres",
-    database: "ash_postgres_test",
-    hostname: "localhost",
+    username: System.get_env("PGUSER", "postgres"),
+    password: System.get_env("PGPASSWORD", "postgres"),
+    database: System.get_env("PGDATABASE", "ash_postgres_test"),
+    hostname: System.get_env("PGHOST", "localhost"),
     port: pg_port,
     pool: Ecto.Adapters.SQL.Sandbox,
     types: AshPostgres.Test.PostgrexTypes
