@@ -320,12 +320,15 @@ defmodule AshPostgres.MigrationGeneratorTest do
     setup %{snapshot_path: snapshot_path, migration_path: migration_path} do
       {:ok, _pid} =
         TimestamptzToggleRepo.start_link(
-          username: "postgres",
-          password: "postgres",
-          database: "ash_postgres_test",
-          hostname: "localhost",
-          pool: Ecto.Adapters.SQL.Sandbox,
-          types: AshPostgres.Test.PostgrexTypes
+          Keyword.take(AshPostgres.TestRepo.config(), [
+            :username,
+            :password,
+            :database,
+            :hostname,
+            :port,
+            :pool,
+            :types
+          ])
         )
 
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(TimestamptzToggleRepo)
