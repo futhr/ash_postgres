@@ -16,10 +16,17 @@ defmodule AshPostgres.Verifiers.VerifyTemporal do
   alias Spark.Dsl.Verifier
 
   def verify(dsl) do
+    if is_nil(Ash.Resource.Info.temporal_strategy(dsl)) do
+      :ok
+    else
+      verify_temporal_repo(dsl)
+    end
+  end
+
+  defp verify_temporal_repo(dsl) do
     repo = AshPostgres.DataLayer.Info.repo(dsl, :mutate)
 
-    if is_nil(Ash.Resource.Info.temporal_strategy(dsl)) or is_nil(repo) or
-         not Code.ensure_loaded?(repo) do
+    if is_nil(repo) or not Code.ensure_loaded?(repo) do
       :ok
     else
       resource = Verifier.get_persisted(dsl, :module)
